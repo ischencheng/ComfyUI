@@ -9,11 +9,17 @@ import traceback
 from enum import Enum
 from typing import List, Literal, NamedTuple, Optional
 import asyncio
+import json
 
 import torch
 
 import comfy.model_management
 import nodes
+import sys
+# Make bmf modules available
+sys.path.append('/root/bmf/output')
+from demo.comfyui_intergration.bridge import BmfWorkflowConverter
+import bmf
 from comfy_execution.caching import (
     BasicCache,
     CacheKeySetID,
@@ -577,6 +583,19 @@ class PromptExecutor:
             self.add_message("execution_error", mes, broadcast=False)
 
     def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+        with open("/root/bmf/output/demo/comfyui_intergration/prompt.json", "w") as f:
+            json.dump(prompt, f)
+        with open("/root/bmf/output/demo/comfyui_intergration/extra_data.json", "w") as f:
+            json.dump(extra_data, f)
+        with open("/root/bmf/output/demo/comfyui_intergration/execute_outputs.json", "w") as f:
+            json.dump(execute_outputs, f)
+        with open("/root/bmf/output/demo/comfyui_intergration/prompt_id.json", "w") as f:
+            json.dump(prompt_id, f)
+
+        if extra_data.get("enable_bmf", True):
+            self.execute_by_bmf(prompt, prompt_id, extra_data, execute_outputs)
+            return
+
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
         asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
@@ -653,6 +672,15 @@ class PromptExecutor:
             self.server.last_node_id = None
             if comfy.model_management.DISABLE_SMART_MEMORY:
                 comfy.model_management.unload_all_models()
+
+    def execute_by_bmf(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+        converter = BmfWorkflowConverter(prompt, self.server)
+        graph_config = converter.convert()
+        
+        # Instantiate a bmf graph and run it with the generated config
+        bmf_graph = bmf.graph()
+        bmf_graph.run_by_config(graph_config)
+        self.success = True
 
 
 async def validate_inputs(prompt_id, prompt, item, validated):
