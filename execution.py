@@ -18,8 +18,10 @@ import nodes
 import sys
 # Make bmf modules available
 sys.path.append('/root/bmf/output')
-from demo.comfyui_intergration.bridge import BmfWorkflowConverter
 import bmf
+from bmf.builder.bmf_stream import BmfStream
+from bmf.python_sdk import Timestamp
+from demo.comfyui_intergration.bridge import BmfWorkflowConverter
 from comfy_execution.caching import (
     BasicCache,
     CacheKeySetID,
@@ -592,13 +594,19 @@ class PromptExecutor:
         with open("/root/bmf/output/demo/comfyui_intergration/prompt_id.json", "w") as f:
             json.dump(prompt_id, f)
 
-        if extra_data.get("enable_bmf", True):
-            self.execute_by_bmf(prompt, prompt_id, extra_data, execute_outputs)
-            return
+        # Force BMF execution for debugging
+        print("[ComfyUI execute] Forcing BMF execution path for debugging.")
+        self.execute_by_bmf(prompt, prompt_id, extra_data, execute_outputs)
+        return
 
-        asyncio_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(asyncio_loop)
-        asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
+        # Original logic commented out for now
+        # if extra_data.get("enable_bmf", False):
+        #     self.execute_by_bmf(prompt, prompt_id, extra_data, execute_outputs)
+        #     return
+        #
+        # asyncio_loop = asyncio.new_event_loop()
+        # asyncio.set_event_loop(asyncio_loop)
+        # asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
 
     async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
         nodes.interrupt_processing(False)
@@ -674,14 +682,33 @@ class PromptExecutor:
                 comfy.model_management.unload_all_models()
 
     def execute_by_bmf(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+        print("[ComfyUI execute_by_bmf] Starting BMF execution.")
         converter = BmfWorkflowConverter(prompt, self.server)
-        graph_config = converter.convert()
+        graph_config = converter.convert(execute_outputs)
         
-        # Instantiate a bmf graph and run it with the generated config
         bmf_graph = bmf.graph()
-        bmf_graph.run_by_config(graph_config)
+        
+        print(f"[ComfyUI execute_by_bmf] Converted workflow. Final output nodes: {execute_outputs}")
+        
+        returned_stream_names = bmf_graph.run_by_config(graph_config)
+        
+        if not returned_stream_names:
+            print("[ComfyUI execute_by_bmf] No output streams to poll. Graph might have finished.")
+        else:
+            print(f"[ComfyUI execute_by_bmf] Polling output streams: {returned_stream_names}")
+            for stream_name in returned_stream_names:
+                print(f"[ComfyUI execute_by_bmf] Polling stream: {stream_name}")
+                while True:
+                    pkt = bmf_graph.poll_packet(stream_name, True)
+                    if not (pkt and pkt.defined()):
+                        break
+                    if pkt.timestamp == Timestamp.EOF:
+                        print(f"[ComfyUI execute_by_bmf] Received EOF for stream: {stream_name}")
+                        break
+        
+        print("[ComfyUI execute_by_bmf] All streams finished. Closing BMF graph.")
+        bmf_graph.close()
         self.success = True
-
 
 async def validate_inputs(prompt_id, prompt, item, validated):
     unique_id = item
