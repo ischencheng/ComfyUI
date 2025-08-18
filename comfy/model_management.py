@@ -464,12 +464,25 @@ class LoadedModel:
         self.model.model_patches_to(self.device)
         self.model.model_patches_to(self.model.model_dtype())
 
-        # if self.model.loaded_size() > 0:
-        use_more_vram = lowvram_model_memory
-        if use_more_vram == 0:
-            use_more_vram = 1e32
-        self.model_use_more_vram(use_more_vram, force_patch_weights=force_patch_weights)
-        real_model = self.model.model
+        # If lowvram_model_memory is <= 0, perform a full load rather than passing
+        # a huge sentinel value which leads to confusing memory logs and potential instability
+        if lowvram_model_memory is None or lowvram_model_memory <= 0:
+            # Full load path
+            try:
+                # Load all weights to the target device in one go
+                self.model.patch_model(device_to=self.device,
+                                       lowvram_model_memory=0,
+                                       load_weights=True,
+                                       force_patch_weights=force_patch_weights)
+            except Exception as e:
+                # Ensure model is detached on failure to avoid half-loaded state
+                self.model.detach(unpatch_all=True)
+                raise e
+            real_model = self.model.model
+        else:
+            # Partial/low-vram path – load as much as we can according to provided budget
+            self.model_use_more_vram(lowvram_model_memory, force_patch_weights=force_patch_weights)
+            real_model = self.model.model
 
         if is_intel_xpu() and not args.disable_ipex_optimize and 'ipex' in globals() and real_model is not None:
             with torch.no_grad():
