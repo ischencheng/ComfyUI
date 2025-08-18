@@ -12,6 +12,56 @@ import asyncio
 import json
 
 import torch
+import multiprocessing as mp
+
+
+def bmf_child_execute(prompt, prompt_id, execute_outputs):
+    """Subprocess entry to run BMF graph and fully release CUDA context on exit."""
+    import sys, time
+    # Ensure BMF python API is importable
+    sys.path.append('/root/bmf/output')
+    import bmf
+    from bmf.python_sdk import Timestamp
+    from demo.comfyui_intergration.bridge import BmfWorkflowConverter
+    try:
+        # Build graph from Comfy workflow
+        converter = BmfWorkflowConverter(prompt, None)
+        graph_config = converter.convert(execute_outputs)
+        bmf_graph = bmf.graph()
+        try:
+            returned_stream_names = bmf_graph.run_by_config(graph_config)
+            if returned_stream_names:
+                for stream_name in returned_stream_names:
+                    none_streak = 0
+                    while True:
+                        pkt = bmf_graph.poll_packet(stream_name, True)
+                        if not pkt or not pkt.defined():
+                            none_streak += 1
+                            if none_streak > 5:
+                                break
+                            time.sleep(0.1)
+                            continue
+                        none_streak = 0
+                        if pkt.timestamp == Timestamp.EOF:
+                            break
+        finally:
+            try:
+                bmf_graph.close()
+            except Exception:
+                try:
+                    bmf_graph.force_close()
+                except Exception:
+                    pass
+    finally:
+        # Try to flush CUDA memory in child before exit
+        try:
+            import torch, gc
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            gc.collect()
+        except Exception:
+            pass
 
 import comfy.model_management
 import nodes
@@ -537,6 +587,7 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
 
 class PromptExecutor:
     def __init__(self, server, cache_type=False, cache_size=None):
+        self.history_result = {}
         self.cache_size = cache_size
         self.cache_type = cache_type
         self.server = server
@@ -599,11 +650,11 @@ class PromptExecutor:
         self.execute_by_bmf(prompt, prompt_id, extra_data, execute_outputs)
         return
 
-        # Original logic commented out for now
+        # #Original logic commented out for now
         # if extra_data.get("enable_bmf", False):
         #     self.execute_by_bmf(prompt, prompt_id, extra_data, execute_outputs)
         #     return
-        #
+        
         # asyncio_loop = asyncio.new_event_loop()
         # asyncio.set_event_loop(asyncio_loop)
         # asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
@@ -682,33 +733,13 @@ class PromptExecutor:
                 comfy.model_management.unload_all_models()
 
     def execute_by_bmf(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-        print("[ComfyUI execute_by_bmf] Starting BMF execution.")
-        converter = BmfWorkflowConverter(prompt, self.server)
-        graph_config = converter.convert(execute_outputs)
-        
-        bmf_graph = bmf.graph()
-        
-        print(f"[ComfyUI execute_by_bmf] Converted workflow. Final output nodes: {execute_outputs}")
-        
-        returned_stream_names = bmf_graph.run_by_config(graph_config)
-        
-        if not returned_stream_names:
-            print("[ComfyUI execute_by_bmf] No output streams to poll. Graph might have finished.")
-        else:
-            print(f"[ComfyUI execute_by_bmf] Polling output streams: {returned_stream_names}")
-            for stream_name in returned_stream_names:
-                print(f"[ComfyUI execute_by_bmf] Polling stream: {stream_name}")
-                while True:
-                    pkt = bmf_graph.poll_packet(stream_name, True)
-                    if not (pkt and pkt.defined()):
-                        break
-                    if pkt.timestamp == Timestamp.EOF:
-                        print(f"[ComfyUI execute_by_bmf] Received EOF for stream: {stream_name}")
-                        break
-        
-        print("[ComfyUI execute_by_bmf] All streams finished. Closing BMF graph.")
-        bmf_graph.close()
-        self.success = True
+        """Run BMF execution in a short-lived subprocess to guarantee VRAM release per run."""
+        # Spawn a fresh process to isolate CUDA allocator and free VRAM deterministically
+        ctx = mp.get_context("spawn")
+        p = ctx.Process(target=bmf_child_execute, args=(prompt, prompt_id, execute_outputs))
+        p.start()
+        p.join()
+        self.success = (p.exitcode == 0)
 
 async def validate_inputs(prompt_id, prompt, item, validated):
     unique_id = item
