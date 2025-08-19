@@ -741,6 +741,43 @@ class PromptExecutor:
         p.join()
         self.success = (p.exitcode == 0)
 
+    def execute_by_bmf_same_process(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+        """Run BMF in-process to allow model caching across requests (no subprocess).
+        Assumes Comfy's model_management caches are responsible for memory lifecycle.
+        """
+        print("[ComfyUI execute_by_bmf_same_process] Starting BMF execution.", flush=True)
+        converter = BmfWorkflowConverter(prompt, self.server)
+        graph_config = converter.convert(execute_outputs)
+        bmf_graph = bmf.graph()
+        try:
+            returned_stream_names = bmf_graph.run_by_config(graph_config)
+            if returned_stream_names:
+                print(f"[ComfyUI execute_by_bmf_same_process] Polling output streams: {returned_stream_names}", flush=True)
+                for stream_name in returned_stream_names:
+                    print(f"[ComfyUI execute_by_bmf_same_process] Polling stream: {stream_name}", flush=True)
+                    none_streak = 0
+                    while True:
+                        pkt = bmf_graph.poll_packet(stream_name, True)
+                        if not pkt or not pkt.defined():
+                            none_streak += 1
+                            if none_streak > 5:
+                                break
+                            time.sleep(0.1)
+                            continue
+                        none_streak = 0
+                        if pkt.timestamp == Timestamp.EOF:
+                            break
+            self.success = True
+        finally:
+            print("[ComfyUI execute_by_bmf_same_process] Closing BMF graph.", flush=True)
+            try:
+                bmf_graph.close()
+            except Exception:
+                try:
+                    bmf_graph.force_close()
+                except Exception:
+                    pass
+
 async def validate_inputs(prompt_id, prompt, item, validated):
     unique_id = item
     if unique_id in validated:
