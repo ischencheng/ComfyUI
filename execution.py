@@ -15,53 +15,53 @@ import torch
 import multiprocessing as mp
 
 
-def bmf_child_execute(prompt, prompt_id, execute_outputs):
-    """Subprocess entry to run BMF graph and fully release CUDA context on exit."""
-    import sys, time
-    # Ensure BMF python API is importable
-    sys.path.append('/root/bmf/output')
-    import bmf
-    from bmf.python_sdk import Timestamp
-    from demo.comfyui_intergration.bridge import BmfWorkflowConverter
-    try:
-        # Build graph from Comfy workflow
-        converter = BmfWorkflowConverter(prompt, None)
-        graph_config = converter.convert(execute_outputs)
-        bmf_graph = bmf.graph()
-        try:
-            returned_stream_names = bmf_graph.run_by_config(graph_config)
-            if returned_stream_names:
-                for stream_name in returned_stream_names:
-                    none_streak = 0
-                    while True:
-                        pkt = bmf_graph.poll_packet(stream_name, True)
-                        if not pkt or not pkt.defined():
-                            none_streak += 1
-                            if none_streak > 5:
-                                break
-                            time.sleep(0.1)
-                            continue
-                        none_streak = 0
-                        if pkt.timestamp == Timestamp.EOF:
-                            break
-        finally:
-            try:
-                bmf_graph.close()
-            except Exception:
-                try:
-                    bmf_graph.force_close()
-                except Exception:
-                    pass
-    finally:
-        # Try to flush CUDA memory in child before exit
-        try:
-            import torch, gc
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-            gc.collect()
-        except Exception:
-            pass
+# def bmf_child_execute(prompt, prompt_id, execute_outputs):
+#     """Subprocess entry to run BMF graph and fully release CUDA context on exit."""
+#     import sys, time
+#     # Ensure BMF python API is importable
+#     sys.path.append('/root/bmf/output')
+#     import bmf
+#     from bmf.python_sdk import Timestamp
+#     from demo.comfyui_intergration.bridge import BmfWorkflowConverter
+#     try:
+#         # Build graph from Comfy workflow
+#         converter = BmfWorkflowConverter(prompt, None)
+#         graph_config = converter.convert(execute_outputs)
+#         bmf_graph = bmf.graph()
+#         try:
+#             returned_stream_names = bmf_graph.run_by_config(graph_config)
+#             if returned_stream_names:
+#                 for stream_name in returned_stream_names:
+#                     none_streak = 0
+#                     while True:
+#                         pkt = bmf_graph.poll_packet(stream_name, True)
+#                         if not pkt or not pkt.defined():
+#                             none_streak += 1
+#                             if none_streak > 5:
+#                                 break
+#                             time.sleep(0.1)
+#                             continue
+#                         none_streak = 0
+#                         if pkt.timestamp == Timestamp.EOF:
+#                             break
+#         finally:
+#             try:
+#                 bmf_graph.close()
+#             except Exception:
+#                 try:
+#                     bmf_graph.force_close()
+#                 except Exception:
+#                     pass
+#     finally:
+#         # Try to flush CUDA memory in child before exit
+#         try:
+#             import torch, gc
+#             if torch.cuda.is_available():
+#                 torch.cuda.synchronize()
+#                 torch.cuda.empty_cache()
+#             gc.collect()
+#         except Exception:
+#             pass
 
 import comfy.model_management
 import nodes
@@ -69,6 +69,7 @@ import sys
 # Make bmf modules available
 sys.path.append('/root/bmf/output')
 import bmf
+from bmf import BMF_TRACE_INIT, BMF_TRACE_DONE
 from bmf.builder.bmf_stream import BmfStream
 from bmf.python_sdk import Timestamp
 from demo.comfyui_intergration.bridge import BmfWorkflowConverter
@@ -636,18 +637,18 @@ class PromptExecutor:
             self.add_message("execution_error", mes, broadcast=False)
 
     def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-        with open("/root/bmf/output/demo/comfyui_intergration/prompt.json", "w") as f:
-            json.dump(prompt, f)
-        with open("/root/bmf/output/demo/comfyui_intergration/extra_data.json", "w") as f:
-            json.dump(extra_data, f)
-        with open("/root/bmf/output/demo/comfyui_intergration/execute_outputs.json", "w") as f:
-            json.dump(execute_outputs, f)
-        with open("/root/bmf/output/demo/comfyui_intergration/prompt_id.json", "w") as f:
-            json.dump(prompt_id, f)
+        # with open("/root/bmf/output/demo/comfyui_intergration/prompt.json", "w") as f:
+        #     json.dump(prompt, f)
+        # with open("/root/bmf/output/demo/comfyui_intergration/extra_data.json", "w") as f:
+        #     json.dump(extra_data, f)
+        # with open("/root/bmf/output/demo/comfyui_intergration/execute_outputs.json", "w") as f:
+        #     json.dump(execute_outputs, f)
+        # with open("/root/bmf/output/demo/comfyui_intergration/prompt_id.json", "w") as f:
+        #     json.dump(prompt_id, f)
 
         # Force BMF execution for debugging
         print("[ComfyUI execute] Forcing BMF execution path for debugging.")
-        self.execute_by_bmf(prompt, prompt_id, extra_data, execute_outputs)
+        self.execute_by_bmf_same_process(prompt, prompt_id, extra_data, execute_outputs)
         return
 
         # #Original logic commented out for now
@@ -746,6 +747,25 @@ class PromptExecutor:
         Assumes Comfy's model_management caches are responsible for memory lifecycle.
         """
         print("[ComfyUI execute_by_bmf_same_process] Starting BMF execution.", flush=True)
+        # Bind client and prompt metadata so hooks can route progress correctly
+        if "client_id" in extra_data:
+            self.server.client_id = extra_data["client_id"]
+        else:
+            self.server.client_id = None
+        self.server.last_prompt_id = prompt_id
+        # Notify UI start
+        self.add_message("execution_start", {"prompt_id": prompt_id}, broadcast=False)
+        BMF_TRACE_INIT()
+        # Initialize progress registry and handler like the original engine
+        try:
+            from comfy_execution.graph import DynamicPrompt
+            from comfy_execution.progress import reset_progress_state, add_progress_handler, WebUIProgressHandler
+            dynamic_prompt = DynamicPrompt(prompt)
+            reset_progress_state(prompt_id, dynamic_prompt)
+            add_progress_handler(WebUIProgressHandler(self.server))
+        except Exception:
+            pass
+
         converter = BmfWorkflowConverter(prompt, self.server)
         graph_config = converter.convert(execute_outputs)
         bmf_graph = bmf.graph()
@@ -766,10 +786,24 @@ class PromptExecutor:
                             continue
                         none_streak = 0
                         if pkt.timestamp == Timestamp.EOF:
+                            # Emit final progress_state update when a graph output completes
+                            try:
+                                from comfy_execution.progress import get_progress_state
+                                reg = get_progress_state()
+                                # Mark all nodes finished for this prompt id
+                                for nid in list(reg.nodes.keys()):
+                                    reg.finish_progress(nid)
+                            except Exception:
+                                pass
                             break
+            # Execution success and UI notify
             self.success = True
+            self.add_message("execution_success", {"prompt_id": prompt_id}, broadcast=False)
         finally:
             print("[ComfyUI execute_by_bmf_same_process] Closing BMF graph.", flush=True)
+            # Allow the tracer's file thread to flush current buffers
+            #time.sleep(1.0)
+            BMF_TRACE_DONE()
             try:
                 bmf_graph.close()
             except Exception:
@@ -777,6 +811,7 @@ class PromptExecutor:
                     bmf_graph.force_close()
                 except Exception:
                     pass
+
 
 async def validate_inputs(prompt_id, prompt, item, validated):
     unique_id = item
