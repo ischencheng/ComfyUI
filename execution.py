@@ -770,6 +770,7 @@ class PromptExecutor:
         graph_config = converter.convert(execute_outputs)
         bmf_graph = bmf.graph()
         try:
+            print(f"[Debug BMF] Running BMF graph for prompt_id: {prompt_id}", flush=True)
             returned_stream_names = bmf_graph.run_by_config(graph_config)
             if returned_stream_names:
                 print(f"[ComfyUI execute_by_bmf_same_process] Polling output streams: {returned_stream_names}", flush=True)
@@ -796,6 +797,7 @@ class PromptExecutor:
                             except Exception:
                                 pass
                             break
+            print(f"[Debug BMF] BMF graph run finished for prompt_id: {prompt_id}", flush=True)
             # Execution success and UI notify
             self.success = True
             self.add_message("execution_success", {"prompt_id": prompt_id}, broadcast=False)
@@ -806,9 +808,11 @@ class PromptExecutor:
             BMF_TRACE_DONE()
             try:
                 bmf_graph.close()
+                print(f"[Debug BMF] BMF graph closed for prompt_id: {prompt_id}", flush=True)
             except Exception:
                 try:
                     bmf_graph.force_close()
+                    print(f"[Debug BMF] BMF graph force_closed for prompt_id: {prompt_id}", flush=True)
                 except Exception:
                     pass
 
